@@ -1,0 +1,172 @@
+#include "xctrack_protocol.h"
+#include <string>
+#include <cstring>
+#include <cmath>
+#include <vector>
+extern void check(bool condition, const char* message);
+
+namespace {
+    using namespace XcTrackProtocol;
+    // Independent reader, rather than checking encoder output with its own code.
+    bool validSentence(const std::string& line) {
+        if (line.size()<7 || line.size()>82 || line.front()!='$' ||
+            line.substr(line.size()-2)!="\r\n") return false;
+        const size_t star = line.size()-5;
+        if (line[star]!='*') return false;
+        unsigned sum=0;
+        for (size_t i=1;i<star;++i) sum^=(unsigned char)line[i];
+        char hex[3]; snprintf(hex,sizeof(hex),"%02X",sum);
+        return line.substr(star+1,2)==hex;
+    }
+    std::vector<std::string> lines(const std::string& batch) {
+        std::vector<std::string> result;
+        size_t start=0, end;
+        while ((end=batch.find("\r\n",start)) != std::string::npos) {
+            if (end>start) result.push_back(batch.substr(start,end-start+2));
+            start=end+2;
+        }
+        return result;
+    }
+    std::string drain(Stream& stream, uint16_t mtu) {
+        std::string result;
+        for (size_t n; (n=stream.chunkSize(mtu)) != 0;) {
+            result.append(stream.data(),n); stream.advance(n);
+        }
+        return result;
+    }
+    GpsLineReceiver::Result feed(GpsLineReceiver& rx, const char* text) {
+        GpsLineReceiver::Result result=GpsLineReceiver::Pending;
+        for (const auto* p=text; *p; ++p) {
+            const auto next=rx.feed((uint8_t)*p);
+            if (next != GpsLineReceiver::Pending) result=next;
+        }
+        return result;
+    }
+    VarioState freshVario(uint32_t ms) {
+        VarioState s; s.sampleSequence=1; s.baroOk=s.outputReady=true;
+        s.updatedMs=s.baroSampleMs=ms; s.pressurePa=101325; s.climbRateMps=-1.25f;
+        s.altitudeM=975;
+        return s;
+    }
+    const char* rmc="$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A\r\n";
+    const char* gga="$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n";
+}
+
+void runXcTrackChecks() {
+    using namespace XcTrackProtocol;
+    check(txMode(0)==TxMode::Off, "no subscription cannot start UART streaming");
+    check(txMode(1)==TxMode::Nmea, "XCTrack notification selects NMEA");
+    check(txMode(2)==TxMode::Json, "existing app indication selects JSON");
+    check(txMode(3)==TxMode::Json, "dual CCCD cannot mix NMEA with JSON responses");
+    {
+        auto s=freshVario(1000);
+        char packet[LINE_BYTES];
+        const auto n=encodeVario(s,1100,packet,sizeof(packet));
+        check(n==strlen(packet) && validSentence(packet), "LK8EX1 framing and XOR checksum");
+        check(std::string(packet).find("$LK8EX1,101325,99999,-125,99,999,*")==0,
+            "LK8EX1 uses Pa and signed cm/s; no fabricated altitude, temperature or battery");
+        const std::string before=packet;
+        s.altitudeM=1700;
+        encodeVario(s,1100,packet,sizeof(packet));
+        check(before==packet, "local QNH altitude must not alter XCTrack's pressure reference");
+        s.outputReady=false; encodeVario(s,1100,packet,sizeof(packet));
+        check(std::string(packet).find(",101325,99999,9999,")!=std::string::npos,
+            "warming-up vario remains unavailable even with good pressure");
+        encodeVario(s,1500,packet,sizeof(packet));
+        check(std::string(packet).find(",999999,99999,9999,")!=std::string::npos,
+            "stalled sensor sends unavailable sentinels, not zero climb");
+        s=freshVario(1600); s.pressurePa=NAN;
+        encodeVario(s,1600,packet,sizeof(packet));
+        check(std::string(packet).find(",999999,99999,9999,")!=std::string::npos,
+            "NaN pressure never enters external vario");
+        s.pressurePa=100000; s.climbRateMps=INFINITY;
+        encodeVario(s,1600,packet,sizeof(packet));
+        check(std::string(packet).find(",100000,99999,9999,")!=std::string::npos,
+            "nonfinite vario is absent while pressure stays usable");
+        s=freshVario(0xfffffff0u); encodeVario(s,30,packet,sizeof(packet));
+        check(std::string(packet).find(",101325,99999,-125,")!=std::string::npos,
+            "external measurements survive millis wrap");
+        char tiny[10]={'x'};
+        check(encodeVario(s,30,tiny,sizeof(tiny))==0 && tiny[0]==0,
+            "short output buffer produces no truncated sentence");
+        check(sentence("x\n$bad",packet,sizeof(packet))==0, "sentence body cannot inject a second frame");
+    }
+    {
+        GpsLineReceiver rx;
+        check(feed(rx,rmc)==GpsLineReceiver::Rmc && !strcmp(rx.line(),rmc),
+            "known RMC checksum and original GPS UTC are preserved");
+        check(feed(rx,gga)==GpsLineReceiver::Gga && !strcmp(rx.line(),gga),
+            "known GGA checksum, altitude and geoid separation are preserved");
+        std::string bad=rmc; bad[10]='8';
+        check(feed(rx,bad.c_str())==GpsLineReceiver::Pending, "corrupt GPS checksum rejected");
+        check(feed(rx,"$GPRMC,bogus*QQ\r\n")==GpsLineReceiver::Pending,
+            "nonhex GPS checksum rejected");
+        std::string overflow="$GPRMC,"+std::string(200,'x')+"\r\n";
+        check(feed(rx,overflow.c_str())==GpsLineReceiver::Pending,
+            "oversize UART line discarded without overflow");
+        check(feed(rx,rmc)==GpsLineReceiver::Rmc, "GPS parser resynchronizes after oversize line");
+        rx.feed('$'); rx.feed(0);
+        check(feed(rx,rmc)==GpsLineReceiver::Rmc, "new dollar marker recovers after embedded NUL");
+        char line[LINE_BYTES];
+        sentence("GNGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,",line,sizeof(line));
+        check(feed(rx,line)==GpsLineReceiver::Gga, "multi-GNSS GNGGA talker accepted");
+        sentence("GNRMC,,V,,,,,,,,,,N",line,sizeof(line));
+        check(feed(rx,line)==GpsLineReceiver::Rmc, "multi-GNSS invalid FIX is forwarded honestly");
+        sentence("GPGSV,1,1,00",line,sizeof(line));
+        check(feed(rx,line)==GpsLineReceiver::Pending, "unneeded satellite-view traffic not streamed");
+        for (const char* p=rmc;*p;++p) GpsStore::feed((uint8_t)*p,1000);
+        for (const char* p=gga;*p;++p) GpsStore::feed((uint8_t)*p,1050);
+        const auto frames=GpsStore::read();
+        check(!strcmp(frames.rmc,rmc) && !strcmp(frames.gga,gga) && frames.ggaMs==1050,
+            "GPS task publishes complete immutable frame snapshots");
+    }
+    {
+        GpsState gps; gps.fix=true; gps.fixMs=1000;
+        gps.latitude=48.1173; gps.longitude=11.516667; gps.satellites=8; gps.hdop=.9f;
+        GpsFrames frames;
+        memcpy(frames.rmc,rmc,strlen(rmc)+1); memcpy(frames.gga,gga,strlen(gga)+1);
+        frames.rmcMs=frames.ggaMs=1000;
+        std::string baseline;
+        for (int requestedMtu : {0,23,40,185,517}) {
+            const uint16_t mtu = (uint16_t)requestedMtu;
+            Stream stream; stream.prepare(1000,freshVario(1000),gps,frames);
+            const size_t first=stream.chunkSize(mtu);
+            check(first<=182 && first<=max(23,(int)mtu)-3,
+                "notification fragments fit every negotiated MTU");
+            const std::string batch=drain(stream,mtu);
+            if (baseline.empty()) baseline=batch;
+            check(batch==baseline, "MTU fragmentation preserves identical complete sentences");
+            const auto all=lines(batch);
+            check(all.size()==3 && validSentence(all[0]) && all[1]==rmc && all[2]==gga,
+                "XCTrack receives checksummed LK8EX1 plus original RMC/GGA");
+            stream.prepare(1199,freshVario(1199),gps,frames);
+            check(stream.chunkSize(mtu)==0, "vario stream does not busy-publish between 5 Hz samples");
+            stream.prepare(1200,freshVario(1200),gps,frames);
+            check(lines(drain(stream,mtu)).size()==1, "GPS does not consume 5 Hz bandwidth");
+        }
+        Stream stream;
+        stream.prepare(1000,freshVario(1000),gps,frames);
+        const auto pending=std::string(stream.data(),stream.chunkSize(23));
+        stream.prepare(1100,freshVario(1100),gps,frames);
+        check(std::string(stream.data(),stream.chunkSize(23))==pending,
+            "controller congestion retries same fragment without silently skipping bytes");
+        stream.advance(20);
+        stream.prepare(1250,freshVario(1250),gps,frames);
+        check(std::string(stream.data(),2)=="\r\n", "expired partial transmission starts a clean NMEA line");
+        drain(stream,23);
+        stream.prepare(4000,freshVario(4000),gps,frames);
+        const auto lost=lines(drain(stream,23));
+        check(lost.size()==3 && lost[1].find("$GPRMC,,V,")==0 &&
+            lost[2].find("$GPGGA,,,,,,0,")==0 && validSentence(lost[1]) && validSentence(lost[2]),
+            "old GPS FIX is explicitly invalidated without inventing new timestamps");
+        stream.reset(); gps.fixMs=5000; gps.hdop=9; frames.rmcMs=frames.ggaMs=5000;
+        stream.prepare(5000,freshVario(5000),gps,frames);
+        check(lines(drain(stream,185))[1].find("$GPRMC,,V,")==0,
+            "poor GPS quality cannot leak as a valid position");
+        stream.reset();
+        check(stream.chunkSize(185)==0, "disconnect/mode change discards queued client data");
+        stream.prepare(0xfffffff0u,freshVario(0xfffffff0u),{},{}); drain(stream,23);
+        stream.prepare(184,freshVario(184),{},{});
+        check(stream.chunkSize(23)>0, "5 Hz scheduler handles millis wrap");
+    }
+}

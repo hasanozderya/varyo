@@ -1,0 +1,176 @@
+// Deterministic tests of production estimators; no simulated result is a
+// substitute for a timestamped capture from the physical instrument.
+#include "sensor_fusion.h"
+#include "tunables.h"
+#include "config.h"
+#include "Preferences.h"
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <cstddef>
+
+extern void check(bool, const char*);
+extern bool near(float, float, float);
+
+namespace {
+    template <typename T> void storeRecord(const char* key, T& record) {
+        record.checksum = 2166136261u;
+        auto* bytes = reinterpret_cast<uint8_t*>(&record);
+        for (size_t i=0; i<offsetof(T, checksum); ++i)
+            record.checksum = (record.checksum ^ bytes[i]) * 16777619u;
+        fakeNvs[key] = std::vector<uint8_t>(bytes, bytes+sizeof(T));
+    }
+    struct Response { double quietRms, tailRms; float weakLift; };
+    Response simulate(float baroTau, float baroVariance) {
+        AltitudeKalman k;
+        VarioOutputFilter baroFilter, outputFilter;
+        k.seed(1000,0,baroVariance);
+        float z=1000, v=0, output=0;
+        double quiet=0, tail=0;
+        unsigned nq=0, nt=0;
+        uint32_t rng=42;
+        auto noise = [&]() {
+            float n=-6;
+            for (int i=0; i<12; ++i) {
+                rng=1664525u*rng+1013904223u;
+                n += (rng>>8)*(1.0f/16777216.0f);
+            }
+            return n;
+        };
+        // 30 s settling; +2 m/s^2 for 1 s, 3 s constant climb, -2 for 1 s,
+        // then a true stop. Barometer at 50 Hz, IMU/estimator at 100 Hz.
+        for (int i=0; i<4300; ++i) {
+            float a = i>=3000 && i<3100 ? 2.0f : i>=3400 && i<3500 ? -2.0f : 0.0f;
+            z += v*.01f + .5f*a*.0001f; v += a*.01f;
+            k.predict(a+.03f+.02f*noise(),.01f,2.5f,.0001f,1);
+            if (i%2==0)
+                k.correct(baroFilter.update(z+.59f*noise(),.02f,baroTau),baroVariance);
+            output=outputFilter.update(k.climbRateMps(),.01f,VarioTuning::OUTPUT_LPF_TAU_S);
+            if (i>=1000 && i<2900) { quiet+=output*output; ++nq; }
+            if (i>=3600 && i<3900) { tail+=output*output; ++nt; }
+        }
+        // Constant weak lift has nearly zero acceleration. Never zero it.
+        k.seed(1000,.05f,baroVariance);
+        for (int i=1; i<=2000; ++i) {
+            k.predict(0,.01f,2.5f,.0001f,1);
+            if (i%2==0) k.correct(1000+.05f*i*.01f,baroVariance);
+        }
+        return {sqrt(quiet/nq),sqrt(tail/nt),k.climbRateMps()};
+    }
+}
+
+void runStabilityChecks() {
+    for (uint32_t origin : {0u, 0xffff0000u}) {
+        BaroVarioRegression r;
+        for (unsigned i=0; i<1000; ++i)
+            r.addSample(500+1.5f*i*.01f,origin+i*10000,3000000,12);
+        check(r.samplesUsed()==301 && r.spanUs()==3000000,
+              "regression really covers 3 s at 100 Hz through ring/time wrap");
+        check(near(r.climbRateMps(),1.5f,.005f),"full-window regression preserves constant climb");
+        r.rebase(1.02f,100);
+        r.addSample(1.02f*515+100,origin+10000000,3000000,12);
+        check(near(r.climbRateMps(),1.53f,.01f),"rebase transforms every slot of the larger ring");
+        r.reset();
+        check(!r.ready() && r.spanUs()==0 && r.samplesUsed()==0,"regression reset clears age and sample count");
+    }
+    for (float rate : {-.05f,.05f,-3.0f,3.0f}) {
+        AltitudeKalman k; k.seed(1000,rate,.35f);
+        for (int i=1; i<=1000; ++i) {
+            k.predict(0,.01f,2.5f,.0001f,1);
+            k.correct(1000+rate*i*.01f,.35f);
+        }
+        const float before=k.climbRateMps();
+        k.correct(k.altitudeM()+40,.35f);
+        check(fabsf(k.climbRateMps()-before)<.12f,
+              "isolated 40 m baro spike cannot reset an airborne vario to zero");
+        for (int i=1001; i<=1400; ++i) {
+            k.predict(0,.01f,2.5f,.0001f,1);
+            k.correct(1000+rate*i*.01f,.35f);
+        }
+        check(near(k.climbRateMps(),rate,.04f),"baro spike recovery retains true lift and sink");
+    }
+    {
+        AltitudeKalman k; k.seed(800,2,.35f);
+        for (float bad : {NAN,INFINITY,-1.0f}) {
+            k.predict(0,.01f,2.5f,.0001f,bad);
+            k.predict(0,.01f,bad,.0001f,1);
+            k.correct(1000,bad);
+        }
+        check(near(k.altitudeM(),800,.0001f) && near(k.climbRateMps(),2,.0001f),
+              "nonfinite or negative uncertainty cannot poison filter state");
+        for (int i=0; i<100000; ++i) {
+            const float dt = i%7==0 ? .02f : .01f;
+            k.predict(0,dt,2.5f,.0001f,1);
+            k.correct(800+.05f*sinf(i*.05f),i%19==0 ? 1e-4f : .35f);
+        }
+        check(isfinite(k.altitudeM()) && isfinite(k.climbRateMps()) &&
+              k.kalmanGain(.35f)>=0 && k.kalmanGain(.35f)<=1,
+              "long irregular-rate Joseph updates remain finite with bounded variance");
+    }
+    {
+        AttitudeFilter attitude;
+        float previous=0, maxVertical=0;
+        attitude.update(0,0,1,0,0,0,.01f,.98f);
+        for (int i=1; i<=3000; ++i) {
+            const float angle=1.04719755f*sinf(i*.01f*1.2f);
+            const float gyro=(angle-previous)/.01f;
+            attitude.update(0,sinf(angle),cosf(angle),gyro,0,0,.01f,.98f);
+            maxVertical=fmaxf(maxVertical,fabsf(attitude.earthZAccelMps2(0,sinf(angle),cosf(angle),0)));
+            previous=angle;
+        }
+        check(maxVertical<.005f,"ideal repeated 60 degree tilts do not create earth-Z acceleration");
+        // Gravity and real vertical acceleration both rotate into body axes.
+        const float a=attitude.earthZAccelMps2(0,1.1f*sinf(previous),1.1f*cosf(previous),0);
+        check(near(a,.980665f,.01f),"vertical acceleration remains active while tilted");
+    }
+    {
+        const auto original=fakeNvs;
+        const auto current=TunablesStore::read();
+        struct F2 { float alpha,a,ab,baro,qnh; };
+        struct V2 { F2 fusion; AudioParams audio; };
+        struct Old { uint32_t version; V2 value; uint32_t checksum; } old{};
+        static_assert(sizeof(Old)==76,"fixture matches shipped v2 byte layout");
+        old.version=2; old.value.fusion={.97f,6,.0002f,.8f,997};
+        old.value.audio=current.audio;
+        old.value.audio.volume=67; old.value.audio.sinkToneHz=555;
+        fakeNvs.clear(); storeRecord("settings_v2",old);
+        TunablesStore::init();
+        auto migrated=TunablesStore::read();
+        check(migrated.fusion.qnhHpa==997 && migrated.fusion.kfAccelVar==6 &&
+              migrated.fusion.kfBaroVar==.8f && migrated.audio.volume==67 && migrated.audio.sinkToneHz==555,
+              "adding adaptive parameter preserves shipped v2 fusion AND audio settings");
+        check(migrated.fusion.kAdaptFactor==VarioTuning::KF_ADAPT_FACTOR,
+              "only new adaptive field receives default during v2 migration");
+        check(TunablesStore::writeFusion(migrated.fusion),"migrated settings commit to v3");
+        check(fakeNvs["settings_v2"].size()==76 && fakeNvs["settings_v3"].size()==80,
+              "saving v3 leaves original v2 recoverable");
+        TunablesStore::init();
+        check(TunablesStore::read().audio.volume==67,"v3 survives reload without audio loss");
+        for (float invalid : {NAN,INFINITY,-1.0f,10.1f}) {
+            auto f=migrated.fusion; f.kAdaptFactor=invalid;
+            check(!TunablesStore::writeFusion(f),"adaptive factor validation actually runs");
+        }
+        fakeNvs["settings_v3"][8]^=0x40;
+        TunablesStore::init();
+        check(TunablesStore::read().fusion.qnhHpa==1013.25f,
+              "corrupt v3 cannot silently resurrect older v2 settings");
+        struct Interim { uint32_t version; Tunables value; uint32_t checksum; } interim{};
+        interim.version=2; interim.value=migrated; interim.value.fusion.kAdaptFactor=2;
+        fakeNvs.clear(); storeRecord("settings_v2",interim);
+        TunablesStore::init();
+        check(TunablesStore::read().fusion.kAdaptFactor==2 && TunablesStore::read().audio.volume==67,
+              "interim extended-v2 firmware settings also migrate");
+        fakeNvs=original;
+        TunablesStore::init();
+    }
+    for (float variance : {.1f,.35f,1.4f}) {
+        check(fmaxf(variance,VarioTuning::KF_BARO_VAR_FLOOR)==variance,
+              "valid user barometer uncertainty is not silently clamped to 0.35");
+        const auto old=simulate(1.2f,variance), current=simulate(VarioTuning::BARO_PRESSURE_LPF_TAU_S,variance);
+        printf("SYNTHETIC R=%.2f old/current: quiet RMS %.3f/%.3f m/s, post-stop RMS %.3f/%.3f m/s\n",
+               variance,old.quietRms,current.quietRms,old.tailRms,current.tailRms);
+        check(current.tailRms<old.tailRms*.8,"short baro prefilter reduces stop tail on identical synthetic data");
+        check(current.quietRms<.15,"short baro prefilter retains bounded quiet noise in synthetic test");
+        check(near(current.weakLift,.05f,.005f),"weak constant lift is not hidden by adaptive filter");
+    }
+}
