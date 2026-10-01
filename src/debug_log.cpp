@@ -49,7 +49,7 @@ void DebugLog::log(const char* text) {
     // baglanti kesilirken host FIFO'sunu bosaltmayi birakip
     // Serial.print()/write()'i suresiz bloklamasi ("seri port baglanip
     // kesilince vario donuyor" hatasi) buradan tamamen kaldirildi.
-    // Serial mirror'lama artik SADECE web_task icinde, dusuk oncelikli
+    // Serial mirror'lama artik SADECE ble_task icinde, dusuk oncelikli
     // ve non-blocking sekilde, pullNewForSerial() ile yapiliyor.
     if (!s_mutex) return;
     if (xSemaphoreTake(s_mutex, 0) == pdTRUE) {
@@ -83,7 +83,7 @@ String DebugLog::pullNewForSerial() {
         size_t evictedTotal = s_totalAppended - s_len; // artik buffer'da olmayan toplam bayt
 
         // Cursor, daha once mirror'lanamadan buffer'dan silinmis
-        // veriyi isaret ediyorsa (web_task yeterince sik cagrilmadiysa)
+        // veriyi isaret ediyorsa (ble_task yeterince sik cagrilmadiysa)
         // o kayip satirlari atlayip mevcut buffer basina hizala.
         if (s_serialCursor < evictedTotal) {
             s_serialCursor = evictedTotal;

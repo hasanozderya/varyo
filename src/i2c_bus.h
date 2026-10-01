@@ -5,7 +5,7 @@
 #include "config.h"
 
 // Thread-safe wrapper around the shared I2C bus. Every peripheral driver
-// (MS5607, MPU6050, SSD1306/U8g2) must acquire this lock before touching
+// (selected barometer, selected IMU, SSD1306/U8g2) must acquire this lock before touching
 // Wire and release it immediately after. Hold times should be a few
 // hundred microseconds — never span a full sensor conversion cycle, or
 // you'll stall the other core's bus access for milliseconds at a time.

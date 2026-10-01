@@ -1,5 +1,5 @@
 #include "maintenance_task.h"
-#include "mpu6050.h"
+#include "imus/imu.h"
 #include "shared_state.h"
 #include "debug_log.h"
 #include <freertos/FreeRTOS.h>
@@ -7,8 +7,9 @@
 
 void maintenanceTaskFunc(void*) {
     uint32_t lastLogMs = 0;
+    uint32_t lastBiasWarningMs = 0;
     for (;;) {
-        MPU6050::serviceStorage();
+        Imu::serviceStorage();
         const uint32_t nowMs = millis();
         if ((uint32_t)(nowMs-lastLogMs) >= 1000) {
             lastLogMs = nowMs;
@@ -18,6 +19,12 @@ void maintenanceTaskFunc(void*) {
                 s.climbRateMps, s.altitudeM,
                 s.earthZAccelMps2, (unsigned long)s.longTicks,
                 (unsigned long)s.maxTickUs, (unsigned long)s.sensorRecoveries);
+            if (s.imuFusionActive && fabsf(s.kalmanAccelBias) >= 0.45f &&
+                (lastBiasWarningMs == 0 || (uint32_t)(nowMs-lastBiasWarningMs) >= 10000)) {
+                lastBiasWarningMs = nowMs;
+                DebugLog::logf("[vario-warning] accel bias near limit: %.3f m/s2; inspect calibration, mounting and vibration\n",
+                               s.kalmanAccelBias);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }

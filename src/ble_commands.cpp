@@ -1,5 +1,4 @@
 #include "config.h"
-#if !VARIO_USE_WIFI
 #include "ble_commands.h"
 #include "tunables.h"
 #include "shared_state.h"
@@ -93,6 +92,7 @@ namespace {
         cJSON_AddNumberToObject(f, "kfAB", t.fusion.kfAccelBiasVar);
         cJSON_AddNumberToObject(f, "kfBaro", t.fusion.kfBaroVar);
         cJSON_AddNumberToObject(f, "qnh", t.fusion.qnhHpa);
+        cJSON_AddNumberToObject(f, "kAdapt", t.fusion.kAdaptFactor);
         cJSON* a = cJSON_AddObjectToObject(out, "audio");
         cJSON_AddNumberToObject(a, "deadband", t.audio.climbDeadbandMps);
         cJSON_AddNumberToObject(a, "climbMax", t.audio.climbMaxMps);
@@ -106,6 +106,9 @@ namespace {
         cJSON_AddNumberToObject(a, "periodMin", t.audio.periodMinMs);
         cJSON_AddNumberToObject(a, "periodMax", t.audio.periodMaxMs);
         cJSON_AddBoolToObject(a, "weakLift", t.audio.weakLift);
+        cJSON_AddBoolToObject(a, "altitudeAlert", t.audio.altitudeAlertEnabled);
+        cJSON_AddNumberToObject(a, "altitudeLimit", t.audio.altitudeLimitM);
+        cJSON_AddNumberToObject(a, "altitudeMargin", t.audio.altitudeWarningMarginM);
     }
 }
 
@@ -191,34 +194,39 @@ String executeBleCommand(const char* jsonLine) {
     } else if (!strcmp(cmd, "getSettings")) {
         if (!allowed(params, "")) return fail("unknown_param");
         settings(result.get());
-    } else if (!strcmp(cmd, "setFusion")) {
-        if (!params->child || !allowed(params, "|alpha||kfA||kfAB||kfBaro||qnh|")) return fail("invalid_params");
+    } else if (!strcmp(cmd, "setSettings")) {
+        if (!allowed(params, "|fusion||audio|")) return fail("invalid_params");
+        cJSON* fusion = cJSON_GetObjectItemCaseSensitive(params, "fusion");
+        cJSON* audio = cJSON_GetObjectItemCaseSensitive(params, "audio");
+        if (!cJSON_IsObject(fusion) || !fusion->child || !cJSON_IsObject(audio) || !audio->child ||
+            !allowed(fusion, "|alpha||kfA||kfAB||kfBaro||qnh||kAdapt|") ||
+            !allowed(audio, "|deadband||climbMax||sinkAlarm||toneMin||toneMax||sinkTone||strongSink||hysteresis||volume||periodMin||periodMax||weakLift||altitudeAlert||altitudeLimit||altitudeMargin|"))
+            return fail("invalid_params");
         Tunables t = TunablesStore::read();
-        if (!patchFloat(params, "alpha", t.fusion.compFilterAlpha) ||
-            !patchFloat(params, "kfA", t.fusion.kfAccelVar) ||
-            !patchFloat(params, "kfAB", t.fusion.kfAccelBiasVar) ||
-            !patchFloat(params, "kfBaro", t.fusion.kfBaroVar) ||
-            !patchFloat(params, "qnh", t.fusion.qnhHpa) ||
-            !TunablesStore::validFusion(t.fusion)) return fail("invalid_fusion");
-        if (!TunablesStore::writeFusion(t.fusion)) return fail("settings_save_failed");
-        settings(result.get());
-    } else if (!strcmp(cmd, "setAudio")) {
-        if (!params->child || !allowed(params, "|deadband||climbMax||sinkAlarm||toneMin||toneMax||sinkTone||strongSink||hysteresis||volume||periodMin||periodMax||weakLift|")) return fail("invalid_params");
-        Tunables t = TunablesStore::read();
-        if (!patchFloat(params, "deadband", t.audio.climbDeadbandMps) ||
-            !patchFloat(params, "climbMax", t.audio.climbMaxMps) ||
-            !patchFloat(params, "sinkAlarm", t.audio.sinkAlarmMps) ||
-            !patchTone(params, "toneMin", t.audio.toneMinHz) ||
-            !patchTone(params, "toneMax", t.audio.toneMaxHz) ||
-            !patchTone(params, "sinkTone", t.audio.sinkToneHz) ||
-            !patchFloat(params, "strongSink", t.audio.strongSinkMps) ||
-            !patchFloat(params, "hysteresis", t.audio.hysteresisMps) ||
-            !patchInt(params, "volume", t.audio.volume, 0, 100) ||
-            !patchInt(params, "periodMin", t.audio.periodMinMs, 60, 2000) ||
-            !patchInt(params, "periodMax", t.audio.periodMaxMs, 60, 2000) ||
-            !patchBool(params, "weakLift", t.audio.weakLift) ||
-            !TunablesStore::validAudio(t.audio)) return fail("invalid_audio");
-        if (!TunablesStore::writeAudio(t.audio)) return fail("settings_save_failed");
+        if (!patchFloat(fusion, "alpha", t.fusion.compFilterAlpha) ||
+            !patchFloat(fusion, "kfA", t.fusion.kfAccelVar) ||
+            !patchFloat(fusion, "kfAB", t.fusion.kfAccelBiasVar) ||
+            !patchFloat(fusion, "kfBaro", t.fusion.kfBaroVar) ||
+            !patchFloat(fusion, "qnh", t.fusion.qnhHpa) ||
+            !patchFloat(fusion, "kAdapt", t.fusion.kAdaptFactor) ||
+            !patchFloat(audio, "deadband", t.audio.climbDeadbandMps) ||
+            !patchFloat(audio, "climbMax", t.audio.climbMaxMps) ||
+            !patchFloat(audio, "sinkAlarm", t.audio.sinkAlarmMps) ||
+            !patchTone(audio, "toneMin", t.audio.toneMinHz) ||
+            !patchTone(audio, "toneMax", t.audio.toneMaxHz) ||
+            !patchTone(audio, "sinkTone", t.audio.sinkToneHz) ||
+            !patchFloat(audio, "strongSink", t.audio.strongSinkMps) ||
+            !patchFloat(audio, "hysteresis", t.audio.hysteresisMps) ||
+            !patchInt(audio, "volume", t.audio.volume, 0, 100) ||
+            !patchInt(audio, "periodMin", t.audio.periodMinMs, 60, 2000) ||
+            !patchInt(audio, "periodMax", t.audio.periodMaxMs, 60, 2000) ||
+            !patchBool(audio, "weakLift", t.audio.weakLift) ||
+            !patchBool(audio, "altitudeAlert", t.audio.altitudeAlertEnabled) ||
+            !patchFloat(audio, "altitudeLimit", t.audio.altitudeLimitM) ||
+            !patchFloat(audio, "altitudeMargin", t.audio.altitudeWarningMarginM) ||
+            !TunablesStore::validFusion(t.fusion) || !TunablesStore::validAudio(t.audio))
+            return fail("invalid_settings");
+        if (!TunablesStore::write(t)) return fail("settings_save_failed");
         settings(result.get());
     } else if (!strcmp(cmd, "calibrateAltitude")) {
         double altitude;
@@ -231,7 +239,7 @@ String executeBleCommand(const char* jsonLine) {
         Tunables t = TunablesStore::read();
         t.fusion.qnhHpa = qnh;
         if (!TunablesStore::validFusion(t.fusion)) return fail("invalid_qnh");
-        if (!TunablesStore::writeFusion(t.fusion)) return fail("settings_save_failed");
+        if (!TunablesStore::write(t)) return fail("settings_save_failed");
         cJSON_AddNumberToObject(result.get(), "qnh", qnh);
         cJSON_AddNumberToObject(result.get(), "altitude", altitude);
     } else if (!strcmp(cmd, "calibrateImu")) {
@@ -280,4 +288,3 @@ String executeBleCommand(const char* jsonLine) {
     cJSON_AddItemToObject(reply.get(), "result", result.release());
     return print(reply.get());
 }
-#endif

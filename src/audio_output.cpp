@@ -8,11 +8,21 @@
 namespace {
     portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
     AudioToneRequest request;
+    struct AudioClipRequest {
+        const int16_t* samples = nullptr;
+        size_t sampleCount = 0;
+        int volume = 0;
+        uint32_t generation = 0;
+    } clipRequest;
+    struct AudioRequestSnapshot {
+        AudioToneRequest tone;
+        AudioClipRequest clip;
+    };
     constexpr size_t FRAMES = 128; // 8 ms per block, four DMA blocks
 
-    AudioToneRequest snapshot() {
+    AudioRequestSnapshot snapshot() {
         portENTER_CRITICAL(&mux);
-        const auto result = request;
+        const AudioRequestSnapshot result{request, clipRequest};
         portEXIT_CRITICAL(&mux);
         return result;
     }
@@ -49,9 +59,34 @@ namespace {
                 DebugLog::log("Audio: MAX98357A I2S ready, DATA=4 BCLK=5 WS=6, 16kHz\n");
                 previousError = ESP_OK;
                 AudioPcm pcm;
+                uint32_t clipGeneration = 0;
+                const int16_t* clipSamples = nullptr;
+                size_t clipCount = 0, clipPosition = 0;
+                int clipVolume = 0;
                 for (;;) {
-                    const auto tone = snapshot();
-                    pcm.render(samples, FRAMES, tone.effectiveFrequency(millis()), tone.volume);
+                    const auto audio = snapshot();
+                    if (audio.clip.generation != clipGeneration) {
+                        clipGeneration = audio.clip.generation;
+                        clipSamples = audio.clip.samples;
+                        clipCount = audio.clip.sampleCount;
+                        clipVolume = audio.clip.volume;
+                        clipPosition = 0;
+                    }
+                    if (clipSamples && clipPosition < clipCount && clipVolume > 0) {
+                        for (size_t frame = 0; frame < FRAMES; ++frame) {
+                            int16_t value = 0;
+                            if (clipPosition < clipCount) {
+                                const int32_t scaled =
+                                    (int32_t)clipSamples[clipPosition++] * clipVolume / 100;
+                                value = (int16_t)constrain(scaled, -32768, 32767);
+                            }
+                            samples[frame*2] = samples[frame*2+1] = value;
+                        }
+                        if (clipPosition >= clipCount) clipSamples = nullptr;
+                    } else {
+                        pcm.render(samples, FRAMES,
+                            audio.tone.effectiveFrequency(millis()), audio.tone.volume);
+                    }
                     size_t written = 0;
                     error = i2s_channel_write(tx, samples, sizeof(samples), &written, 100);
                     if (error != ESP_OK || written != sizeof(samples)) {
@@ -80,4 +115,17 @@ void AudioOutput::setTone(uint32_t frequency, int volume) {
     portENTER_CRITICAL(&mux);
     request = next;
     portEXIT_CRITICAL(&mux);
+}
+
+void AudioOutput::playClip(const int16_t* samples, size_t sampleCount, int volume) {
+    portENTER_CRITICAL(&mux);
+    clipRequest.samples = samples;
+    clipRequest.sampleCount = samples ? sampleCount : 0;
+    clipRequest.volume = constrain(volume, 0, 100);
+    if (++clipRequest.generation == 0) ++clipRequest.generation;
+    portEXIT_CRITICAL(&mux);
+}
+
+void AudioOutput::stopClip() {
+    playClip(nullptr, 0, 0);
 }

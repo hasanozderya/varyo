@@ -1,10 +1,39 @@
 #include "buzzer.h"
 #include "config.h"
 #include "audio_output.h"
+#include "generated/voice_prompts.h"
 #include <math.h>
 
 void Buzzer::begin() {
+    pendingVoice_ = nullptr;
+    pendingVoiceSamples_ = 0;
+    AudioOutput::stopClip();
     tone(0, 0);
+}
+void Buzzer::playEvent(Event event) {
+    AudioOutput::stopClip();
+    switch (event) {
+        case Event::FlightStarted:
+            pendingVoice_ = VoicePrompts::FLIGHT_STARTED;
+            pendingVoiceSamples_ = VoicePrompts::FLIGHT_STARTED_COUNT;
+            break;
+        case Event::FlightEnded:
+            pendingVoice_ = VoicePrompts::FLIGHT_ENDED;
+            pendingVoiceSamples_ = VoicePrompts::FLIGHT_ENDED_COUNT;
+            break;
+        case Event::GpsAcquired:
+            pendingVoice_ = VoicePrompts::GPS_ACQUIRED;
+            pendingVoiceSamples_ = VoicePrompts::GPS_ACQUIRED_COUNT;
+            break;
+        case Event::GpsLost:
+            pendingVoice_ = VoicePrompts::GPS_LOST;
+            pendingVoiceSamples_ = VoicePrompts::GPS_LOST_COUNT;
+            break;
+        case Event::AltitudeLimitApproaching:
+            pendingVoice_ = VoicePrompts::ALTITUDE_LIMIT_APPROACHING;
+            pendingVoiceSamples_ = VoicePrompts::ALTITUDE_LIMIT_APPROACHING_COUNT;
+            break;
+    }
 }
 void Buzzer::tone(uint32_t frequency, int volume) {
     if (volume == 0) frequency = 0;
@@ -21,19 +50,39 @@ void Buzzer::update(float v, const AudioParams& p, bool valid) {
     else if (p.weakLift && v > -0.3f) next = Mode::Weak;
     if (next != mode_) {
         mode_ = next; modeSinceMs_ = ms; toneOn_ = false; nextEventUs_ = now;
+        if (mode_ == Mode::Fault || mode_ == Mode::Alarm) {
+            pendingVoice_ = nullptr;
+            pendingVoiceSamples_ = 0;
+            AudioOutput::stopClip();
+        }
     }
     if (mode_ == Mode::Fault) {
+        if (pendingVoice_) {
+            pendingVoice_ = nullptr;
+            pendingVoiceSamples_ = 0;
+            AudioOutput::stopClip();
+        }
         // A short double chirp after 3 seconds, then every 10 seconds.
         const uint32_t elapsed = ms - modeSinceMs_;
         const uint32_t phase = elapsed >= 3000 ? (elapsed-3000)%10000 : 1000;
         tone(phase < 120 ? 900 : phase >= 240 && phase < 360 ? 450 : 0, p.volume);
         return;
     }
-    if (mode_ == Mode::Quiet) { tone(0, p.volume); return; }
     if (mode_ == Mode::Alarm) {
+        if (pendingVoice_) {
+            pendingVoice_ = nullptr;
+            pendingVoiceSamples_ = 0;
+            AudioOutput::stopClip();
+        }
         tone(((ms-modeSinceMs_)/200)%2 ? 450 : 850, p.volume);
         return;
     }
+    if (pendingVoice_) {
+        AudioOutput::playClip(pendingVoice_, pendingVoiceSamples_, p.volume);
+        pendingVoice_ = nullptr;
+        pendingVoiceSamples_ = 0;
+    }
+    if (mode_ == Mode::Quiet) { tone(0, p.volume); return; }
     if (mode_ == Mode::Sink) {
         const float t = constrain((p.sinkAlarmMps-v)/fmaxf(1.0f, fabsf(p.sinkAlarmMps)), 0.0f, 1.0f);
         const int minimumSinkHz = min(p.sinkToneHz, 350);

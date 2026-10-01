@@ -14,7 +14,7 @@ struct VarioState {
     float earthZAccelMps2  = 0.0f;   // gravity-removed vertical acceleration
     float kalmanAccelBias  = 0.0f;   // Kalman's estimated accel bias
     float baroAltitudeM    = 0.0f;   // filtered baro-derived altitude
-    float pressurePa       = 0.0f;   // filtered MS5607 pressure used by altitude calibration
+    float pressurePa       = 0.0f;   // filtered barometer pressure used by altitude calibration
 
     float pitchDeg         = 0.0f;
     float rollDeg          = 0.0f;

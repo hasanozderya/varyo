@@ -1,0 +1,432 @@
+// Compiles the production C++ modules. Only hardware/RTOS/NVS are stubbed.
+#include "sensor_fusion.h"
+#include "pressure_math.h"
+#include "shared_state.h"
+#include "ble_protocol.h"
+#include "buzzer.h"
+#include "audio_output.h"
+#include "audio_pcm.h"
+#include "flight_state.h"
+#include "gps_audio_state.h"
+#include "altitude_alert.h"
+#include "Preferences.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <cmath>
+#include <cstring>
+uint64_t fakeUs = 0;
+uint32_t fakeToneHz = 0, fakeDuty = 0, toneChanges = 0;
+uint32_t audioRequests = 0;
+uint32_t audioClipRequests = 0, audioClipStops = 0;
+size_t lastAudioClipSamples = 0;
+int lastAudioClipVolume = 0;
+void AudioOutput::setTone(uint32_t frequency, int volume) {
+    ++audioRequests;
+    if (frequency != fakeToneHz) ++toneChanges;
+    fakeToneHz = frequency;
+    fakeDuty = frequency && volume > 0 ? volume : 0;
+}
+void AudioOutput::playClip(const int16_t*, size_t sampleCount, int volume) {
+    ++audioClipRequests;
+    lastAudioClipSamples = sampleCount;
+    lastAudioClipVolume = volume;
+}
+void AudioOutput::stopClip() { ++audioClipStops; }
+bool failStorage = false;
+std::map<std::string, std::vector<uint8_t>> fakeNvs;
+unsigned checks = 0;
+void runXcTrackChecks();
+void runStabilityChecks();
+void check(bool condition, const char* message) {
+    ++checks;
+    if (!condition) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
+}
+bool near(float a, float b, float eps) { return fabsf(a-b) <= eps; }
+void tick(Buzzer& b, float v, const AudioParams& a, uint32_t ms=10, bool valid=true) {
+    fakeUs += (uint64_t)ms*1000; b.update(v, a, valid);
+}
+int main() {
+    {
+        AudioPcm pcm;
+        int16_t samples[3200]{};
+        pcm.render(samples,1600,0,100);
+        bool silent=true;
+        for (auto s:samples) silent &= s==0;
+        check(silent,"PCM starts silent");
+        pcm.render(samples,1600,1000,100);
+        pcm.render(samples,1600,1000,100);
+        double energy=0, sum=0; int crossings=0, peak=0;
+        bool stereo=true;
+        for (int i=0;i<1600;++i) {
+            stereo &= samples[i*2]==samples[i*2+1];
+            const int s=samples[i*2];
+            peak=std::max(peak,abs(s)); energy+=(double)s*s; sum+=s;
+            if(i && samples[(i-1)*2]<0 && s>=0) ++crossings;
+        }
+        const double rms=sqrt(energy/1600);
+        check(stereo,"PCM channels match");
+        check(peak<=26213 && rms>18500 && rms<18560,"sine RMS and 80 percent peak limit");
+        check(fabs(sum/1600)<1 && crossings>=99 && crossings<=100,"1 kHz sine frequency and zero DC");
+        pcm.render(samples,1600,1000,50);
+        pcm.render(samples,1600,1000,50);
+        energy=0; for(int i=0;i<1600;++i) energy+=(double)samples[i*2]*samples[i*2];
+        check(fabs(sqrt(energy/1600)/rms-.5)<.001,"volume scales sine amplitude");
+        pcm.render(samples,1600,0,100);
+        silent=true; for(int i=80*2;i<3200;++i) silent &= samples[i]==0;
+        check(silent,"tone fades to exact silence within 5 ms");
+        pcm.render(samples,1600,99999,100);
+        silent=true; for(auto s:samples) silent &= s==0;
+        check(silent,"invalid frequency remains silent");
+        AudioPcm whole, split; int16_t a[256],b[256];
+        whole.render(a,128,777,100);
+        split.render(b,64,777,100); split.render(b+128,64,777,100);
+        check(memcmp(a,b,sizeof(a))==0,"phase and envelope continue across DMA blocks");
+        AudioToneRequest request{1000,100,0xfffffff0u};
+        check(request.effectiveFrequency(0x000000b7u)==1000,"tone freshness handles millis wrap");
+        check(request.effectiveFrequency(0x000000b8u)==0,"stale tone stops at 200 ms");
+    }
+    {
+        const float a = ms5607CompensatedPressurePa(8000000, 1LL<<31, 5000000000LL);
+        const float b = ms5607CompensatedPressurePa(8000001, 1LL<<31, 5000000000LL);
+        check(near(a,97412.109375f,.005f), "MS5607 preserves fractional Pascal compensation");
+        check(near(b-a,.03125f,.005f), "adjacent ADC counts do not collapse into whole Pa steps");
+    }
+    {
+        int32_t fine=0;
+        const float temperature=bmp280CompensatedTemperatureC(519888,27504,26435,-1000,fine);
+        const float pressure=bmp280CompensatedPressurePa(415148,fine,36477,-10685,3024,
+            2855,140,-7,15500,-14600,6000);
+        check(near(temperature,25.08f,.01f),"BMP280 datasheet temperature compensation matches");
+        check(near(pressure,100653.25f,.1f),"BMP280 datasheet pressure compensation matches");
+    }
+    {
+        check(signExtend24(0x7FFFFF)==8388607,"24-bit positive sign extension");
+        check(signExtend24(0x800000)==-8388608,"24-bit negative sign extension");
+        check(near(bmp5CompensatedTemperatureC(0x190000),25.0f,.0001f),
+              "BMP580/BMP581 temperature scale");
+        check(near(bmp5CompensatedPressurePa(6486400),101350.0f,.001f),
+              "BMP580/BMP581 pressure scale");
+        float pressure=0,temperature=0;
+        dps3xxCompensate(500,250,100.0f,100.0f,40,2,100000,10,3,4,5,6,7,
+                         pressure,temperature);
+        check(near(temperature,25.0f,.0001f),"DPS310/HP303B temperature polynomial");
+        check(near(pressure,101482.5f,.001f),"DPS310/HP303B pressure polynomial");
+    }
+    {
+        VarioOutputFilter f;
+        float peak = 0;
+        for (int i=0; i<1500; ++i) {
+            const float output = f.update(.3f*sinf(2*3.14159265f*i*.01f), .01f, .45f);
+            if (i>500) peak = fmaxf(peak,fabsf(output));
+        }
+        check(peak < .11f, "output reduces +/-0.3 m/s 1 Hz synthetic noise below +/-0.11");
+        f.reset();
+        f.update(0,.01f,.45f);
+        float output = 0;
+        for (int i=0; i<300; ++i) output=f.update(.05f,.01f,.45f);
+        check(near(output,.05f,.0001f), "sustained weak lift is not zeroed");
+        for (int i=0; i<600; ++i) output=f.update(-.05f,.01f,.45f);
+        check(near(output,-.05f,.0001f), "sustained weak sink is not zeroed");
+        f.reset();
+        check(near(f.update(-3,.01f,.45f),-3,.0001f), "in-flight filter start does not invent zero speed");
+        f.rebase(1.02f);
+        check(near(f.update(-3.06f,.01f,.45f),-3.06f,.0001f), "output follows QNH scale without artificial transient");
+        f.reset(); f.update(0,.01f,.45f);
+        for (int i=0; i<110; ++i) output=f.update(4,.01f,.45f);
+        check(output > 3.6f && output < 4, "output reaches 90 percent of step within 1.1 s without overshoot");
+        f.update(NAN,.01f,.45f);
+        check(near(f.update(2,.01f,.45f),2,.0001f), "invalid sample clears previous output state");
+    }
+    // Lost gyro rotation during a shake can leave gravity >30 degrees away.
+    // The old directionTrust gate stayed zero forever, even after settling.
+    for (float lostAngle : {60.0f, 100.0f, 179.9f, 180.0f}) {
+        AttitudeFilter f;
+        f.update(0,0,1,0,0,0,.01f,.98f);
+        for (int i=0; i<100; ++i)
+            f.update(0,0,0, lostAngle*(float)DEG_TO_RAD,0,0,.01f,.98f);
+        f.update(0,0,1,0,0,0,.01f,.98f);
+        check(!f.verticalReferenceReliable(), "lost gravity reference must disable IMU fusion");
+        for (int i=0; i<1000; ++i)
+            f.update(0,0,1,0,0,0,.01f,.98f);
+        check(fabsf(f.earthZAccelMps2(0,0,1,0)) < .02f,
+              "attitude must recover after large shake without reboot/calibration");
+        check(f.verticalReferenceReliable(), "recovered attitude can reenter fusion");
+    }
+    {
+        AttitudeFilter f;
+        f.update(0,0,6,0,0,0,.01f,.98f);
+        check(!f.verticalReferenceReliable(), "do not initialize gravity from a multi-g shake");
+        f.update(0,0,1,0,0,0,.01f,.98f);
+        check(f.verticalReferenceReliable(), "gravity initialization needs no stationary boot calibration");
+        f.update(0,0,1,NAN,0,0,.01f,.98f);
+        check(!f.verticalReferenceReliable(), "invalid gyro is not a reliable vertical reference");
+    }
+    for (float velocity : {-3.0f, 0.0f, 2.0f}) {
+        // Reentering after attitude recovery must inherit the pressure slope,
+        // including in-flight startup, rather than forcing a false zero vario.
+        BaroVarioRegression baro;
+        AltitudeKalman k;
+        for (unsigned i=0; i<110; ++i)
+            baro.addSample(1000+velocity*i*.01f, i*10000,900000,12);
+        k.seed(1000+velocity*1.09f, baro.climbRateMps(), .35f);
+        for (unsigned i=110; i<610; ++i) {
+            k.predict(0,.01f,2.5f,.0001f,0);
+            k.correct(1000+velocity*i*.01f,.35f);
+        }
+        check(near(k.climbRateMps(),velocity,.02f), "fusion recovery preserves real climb and sink");
+    }
+    // Rotation about world vertical while banked: body q and r both matter.
+    for (float bank : {-60.0f, -30.0f, 0.0f, 30.0f, 60.0f}) {
+        AttitudeFilter f;
+        const float r = bank*(float)DEG_TO_RAD, omega=30*(float)DEG_TO_RAD;
+        f.update(0, sinf(r), cosf(r), 0, 0, 0, .01f, .98f);
+        for (int i=0; i<1000; ++i)
+            f.update(0, sinf(r), cosf(r), 0, sinf(r)*omega, cosf(r)*omega, .01f, .98f);
+        check(near(f.pitchRad(), 0, .0005f), "banked yaw must not become pitch");
+        check(near(f.rollRad(), r, .0005f), "banked yaw must preserve roll");
+        check(fabsf(f.earthZAccelMps2(0,sinf(r),cosf(r),0)) < .003f, "banked yaw must not create vertical acceleration");
+    }
+    {
+        AttitudeFilter f;
+        f.update(0,0,1,0,0,0,.01f,.98f);
+        float pitch=0;
+        // Irregular sample intervals, including missed 10 ms reads.
+        for (int i=0; i<50; ++i) {
+            const float dt = i%3 == 0 ? .03f : .01f;
+            pitch += .4f*dt;
+            f.update(-sinf(pitch),0,cosf(pitch),0,.4f,0,dt,.9999f);
+        }
+        check(near(f.pitchRad(),pitch,.001f), "use actual elapsed sample time");
+        const float before=f.pitchRad();
+        f.update(0,0,1,NAN,0,0,.01f,.98f);
+        check(near(before,f.pitchRad(),1e-6f), "nonfinite gyro cannot poison orientation");
+        f.update(0,0,1,0,0,0,0,.98f);
+        check(near(before,f.pitchRad(),1e-6f), "zero dt cannot invent elapsed time");
+    }
+    for (uint32_t origin : {0u, 0xfff90000u}) {
+        BaroVarioRegression r;
+        for (unsigned i=0;i<110;++i) r.addSample(700+2.0f*i*.01f, origin+i*10000,900000,12);
+        check(r.ready() && near(r.climbRateMps(),2,.005f), "100 Hz regression and micros wrap");
+        const float scale=powf(1013.25f/1000.0f,.190295f), offset=44330*(1-scale);
+        r.rebase(scale,offset);
+        check(r.ready() && near(r.climbRateMps(),2*scale,.005f), "QNH rebase preserves ready velocity");
+        r.addSample(scale*(700+2*1.10f)+offset,origin+1100000,900000,12);
+        check(near(r.climbRateMps(),2*scale,.02f), "QNH rebase transforms regression history too");
+    }
+    {
+        AltitudeKalman f; f.seed(1000,2,.35f);
+        const float scale=powf(1013.25f/980.0f,.190295f), offset=44330*(1-scale);
+        f.rebase(scale,offset);
+        check(f.ready() && near(f.altitudeM(),scale*1000+offset,.001f), "Kalman altitude reference transform");
+        check(near(f.climbRateMps(),2*scale,.0001f), "Kalman calibration must not insert zero velocity");
+        f.predict(0,.03f,2.5f,.0001f,0);
+        check(near(f.climbRateMps(),2*scale,.0001f), "constant-speed prediction after rebase");
+    }
+    {
+        SharedState::init();
+        VarioState s; s.updatedMs=1000; s.baroSampleMs=995; s.imuSampleMs=1000;
+        s.sampleSequence=1; s.baroOk=s.imuOk=s.outputReady=s.imuFusionActive=true;
+        s.altitudeM=700; s.climbRateMps=2;
+        SharedState::write(s);
+        check(SharedState::readFresh(1100).outputReady, "fresh measurement stays valid");
+        check(!SharedState::readFresh(1600).outputReady, "stalled measurement cannot remain valid");
+        check(!SharedState::readFresh(1250).imuFusionActive, "stale IMU clears fusion flag");
+        uint8_t packet[20];
+        BleProtocol::encodeTelemetry(SharedState::readFresh(1600),22,1600,packet);
+        uint32_t time; memcpy(&time,packet+4,4);
+        check(time==1000 && !(packet[1]&1), "BLE must not put a fresh clock on stale state");
+        s.outputReady=false; BleProtocol::encodeTelemetry(s,23,2000,packet);
+        check(!(packet[1]&1), "legacy app must reject warming-up vario");
+        s.updatedMs=s.baroSampleMs=s.imuSampleMs=0xfffffff0u; s.outputReady=true;
+        SharedState::write(s);
+        check(SharedState::readFresh(40).outputReady, "measurement age handles millis wrap");
+        GpsState gps; gps.fix=gps.motionValid=gps.altitudeValid=true;
+        gps.fixMs=gps.motionMs=gps.altitudeMs=1000;
+        SharedState::writeGps(gps);
+        check(SharedState::readGps(2000).fix && !SharedState::readGps(4000).fix, "old GPS FIX expires");
+    }
+    {
+        BleProtocol::LineReceiver r;
+        r.feed('{');r.feed('}');
+        check(r.feed('\n')==BleProtocol::LineReceiver::Complete && !strcmp(r.line(),"{}"), "fragmented BLE command");
+        for (unsigned i=0;i<600;++i) r.feed('x');
+        check(r.feed('\n')==BleProtocol::LineReceiver::Invalid, "oversize command discarded");
+        r.feed('a');r.feed(0);r.feed('b');
+        check(r.feed('\n')==BleProtocol::LineReceiver::Invalid, "embedded NUL cannot split command");
+    }
+    for (uint32_t origin : {0u, 0xfffff000u}) {
+        GroundStability g;
+        bool ready = false;
+        for (uint32_t ms=0; ms<=8000; ms+=10) {
+            if (ms%30==0) g.observeImu(origin+ms, true);
+            ready = g.update(origin+ms, true, 0, false, 0);
+            if (ms==7990) check(!ready, "ground calibration requires full quiet interval");
+        }
+        check(ready, "missed IMU poll does not reset ground timer, including wrap");
+        check(!g.update(origin+8100,true,0,false,0), "stale IMU removes ground permission");
+        g.observeImu(origin+8110,true);
+        check(!g.update(origin+8110,true,0,false,0), "new sample must not bypass fresh quiet interval");
+    }
+    {
+        FlightStateMachine f;
+        f.update(0,true,0,true,true,0);
+        check(f.mode()==FlightMode::Ground, "quiet startup marks ground without sensor reset");
+        f.update(100,true,0,false,true,6);
+        f.update(3099,true,0,false,true,6);
+        check(f.mode()==FlightMode::Ground, "brief GPS movement cannot start flight");
+        f.update(3100,true,0,false,true,6);
+        check(f.mode()==FlightMode::Flying && f.session()==1, "sustained GPS motion starts flight");
+        f.update(10000,true,0,true,false,0);
+        f.update(80000,true,0,true,false,0);
+        check(f.mode()==FlightMode::Flying, "GPS loss in smooth flight must not mark landing");
+        f.update(81000,true,0,true,true,0);
+        f.update(140999,true,0,true,true,0);
+        check(f.mode()==FlightMode::Flying, "landing needs a full minute of GPS and ground evidence");
+        f.update(141000,true,0,true,true,0);
+        check(f.mode()==FlightMode::Landed && f.durationMs(200000)==137900, "landing freezes duration");
+        f.start(0xfffffff0u); f.stop(40);
+        check(f.session()==2 && f.durationMs(100)==56, "manual flight and duration handle millis wrap");
+        f.update(100,true,2,false,false,0); f.update(20000,true,2,false,false,0);
+        check(f.mode()==FlightMode::Landed, "manual stop is not undone by continuing airborne motion");
+        FlightStateMachine airborne;
+        airborne.update(100,true,-2,false,false,0);
+        airborne.update(8099,true,-2,false,false,0);
+        check(airborne.mode()==FlightMode::Unknown, "no-GPS motion requires eight seconds");
+        airborne.update(8100,true,-2,false,false,0);
+        check(airborne.mode()==FlightMode::Flying, "airborne startup works without GPS or zeroing");
+        FlightControl::requestStart();
+        check(FlightControl::takeRequest()==1 && FlightControl::takeRequest()==0, "flight request consumed once");
+        FlightControl::requestStop();
+        check(FlightControl::takeRequest()==-1, "manual stop delivered to measurement owner");
+    }
+    {
+        GpsState g; g.fix=g.motionValid=true; g.fixMs=1000;
+        g.latitude=-37.1234567; g.longitude=29.7654321; g.hdop=1.2f;
+        g.satellites=9; g.speedMps=12.34f; g.courseDeg=359.99f;
+        fakeUs=1250000;
+        uint8_t packet[20]; BleProtocol::encodeGps(g,packet);
+        int32_t lat, lon; uint32_t fixTime;
+        memcpy(&lat,packet+4,4); memcpy(&lon,packet+8,4); memcpy(&fixTime,packet+12,4);
+        check(packet[0]==1 && packet[1]==0x23 && packet[2]==9 && packet[3]==12,
+            "GPS flags include conservative age and actual quality");
+        check(lat==-371234567 && lon==297654321 && fixTime==1000,
+            "GPS coordinates and stable identity match Android layout");
+        check((packet[16]|packet[17]<<8)==1234 && (packet[18]|packet[19]<<8)==35999,
+            "GPS speed and course use documented units");
+        g.latitude=NAN; g.hdop=1e30f; BleProtocol::encodeGps(g,packet);
+        check(!(packet[1]&3) && packet[3]==255, "nonfinite GPS and extreme HDOP safely rejected/saturated");
+        VarioState s; s.sampleSequence=1; s.updatedMs=s.baroSampleMs=s.imuSampleMs=1000;
+        s.baroOk=s.imuOk=s.imuCalibrated=s.imuFusionActive=s.outputReady=s.groundStable=true;
+        s.referenceRevision=123; s.flightMode=1;
+        BleProtocol::encodeHealth(s,1100,packet);
+        uint32_t reference; memcpy(&reference,packet+12,4);
+        check(packet[1]==7 && packet[2]==0 && packet[3]==1 && reference==123 && packet[18]==2,
+            "health flags and revision match Android layout");
+        BleProtocol::encodeHealth(s,1500,packet);
+        check(packet[2]==1, "health channel identifies stalled task");
+    }
+    TunablesStore::init();
+    auto a=TunablesStore::read().audio;
+    check(TunablesStore::validAudio(a), "default sound settings valid");
+    {
+        Buzzer b; b.begin();
+        tick(b,-.5f,a); check(fakeDuty==0, "normal sink below threshold must be silent");
+        tick(b,-2.1f,a); check(fakeDuty!=0, "configured sink threshold starts sound");
+        tick(b,-1.98f,a); check(fakeDuty!=0, "sink hysteresis holds near threshold");
+        tick(b,-1.8f,a); check(fakeDuty==0, "sink releases outside hysteresis");
+        tick(b,.2f,a); check(fakeDuty!=0, "climb starts promptly");
+        const auto changes=toneChanges;
+        const auto requests=audioRequests;
+        tick(b,.2f,a); check(toneChanges==changes && audioRequests>requests, "same tone refreshes audio watchdog");
+        tick(b,-6,a); check(fakeToneHz==850 && fakeDuty!=0, "strong sink has separate alarm");
+        tick(b,2,a,10,false); check(fakeDuty==0, "invalid measurement silences flight tone immediately");
+        tick(b,2,a,3000,false); check(fakeToneHz==900 && fakeDuty!=0, "persistent fault emits distinct short notification");
+        a.volume=0; tick(b,3,a); check(fakeDuty==0, "mute includes climb and alarm");
+    }
+    {
+        auto eventAudio=TunablesStore::read().audio;
+        Buzzer b; b.begin();
+        const auto clipRequests=audioClipRequests;
+        b.playEvent(Buzzer::Event::FlightStarted);
+        tick(b,0,eventAudio,10);
+        check(audioClipRequests==clipRequests+1 && lastAudioClipSamples==16219 &&
+              lastAudioClipVolume==eventAudio.volume, "flight start requests Turkish voice clip at main volume");
+        b.playEvent(Buzzer::Event::FlightEnded);
+        tick(b,0,eventAudio,10); check(lastAudioClipSamples==19183, "flight end requests Turkish voice clip");
+        b.playEvent(Buzzer::Event::GpsAcquired);
+        tick(b,0,eventAudio,10); check(lastAudioClipSamples==29419, "GPS acquisition requests Turkish voice clip");
+        b.playEvent(Buzzer::Event::GpsLost);
+        tick(b,0,eventAudio,10); check(lastAudioClipSamples==31405, "GPS loss requests Turkish voice clip");
+        b.playEvent(Buzzer::Event::AltitudeLimitApproaching);
+        tick(b,0,eventAudio,10); check(lastAudioClipSamples==48768, "altitude approach requests Turkish voice clip");
+        b.playEvent(Buzzer::Event::FlightStarted);
+        tick(b,0,eventAudio,10);
+        const auto clipStops=audioClipStops;
+        tick(b,-6,eventAudio,10);
+        check(fakeToneHz==850 && audioClipStops>clipStops, "strong sink alarm preempts flight voice");
+        tick(b,0,eventAudio,10);
+        eventAudio.volume=0;
+        b.playEvent(Buzzer::Event::FlightStarted);
+        tick(b,0,eventAudio,10);
+        check(lastAudioClipVolume==0 && fakeDuty==0, "mute includes flight notifications");
+    }
+    {
+        GpsAudioState gpsAudio;
+        check(gpsAudio.update(1000,false)==GpsAudioState::Event::None, "GPS loss is silent before any fix");
+        check(gpsAudio.update(2000,true)==GpsAudioState::Event::None, "GPS acquisition is debounced");
+        check(gpsAudio.update(3999,true)==GpsAudioState::Event::None, "short GPS fix is not announced");
+        check(gpsAudio.update(4000,true)==GpsAudioState::Event::Acquired, "stable GPS fix is announced once");
+        check(gpsAudio.update(9000,true)==GpsAudioState::Event::None, "stable GPS does not repeat announcement");
+        check(gpsAudio.update(10000,false)==GpsAudioState::Event::None, "GPS loss is delayed");
+        check(gpsAudio.update(14999,false)==GpsAudioState::Event::None, "brief GPS loss is silent");
+        check(gpsAudio.update(15000,false)==GpsAudioState::Event::Lost, "sustained GPS loss is announced once");
+        check(gpsAudio.update(16000,true)==GpsAudioState::Event::None, "GPS reacquisition is debounced again");
+        check(gpsAudio.update(18000,true)==GpsAudioState::Event::Acquired, "GPS reacquisition is announced");
+    }
+    {
+        AltitudeAlertState alert;
+        check(!alert.update(false,true,true,2450,2500,100), "disabled altitude alert stays silent");
+        check(!alert.update(true,false,true,2450,2500,100), "altitude alert is silent on ground");
+        check(!alert.update(true,true,true,2399,2500,100), "altitude below approach band stays silent");
+        check(alert.update(true,true,true,2400,2500,100), "altitude approach threshold announces once");
+        check(!alert.update(true,true,true,2490,2500,100), "altitude alert does not repeat in same band");
+        check(!alert.update(true,true,true,2349,2500,100), "descent rearms altitude alert without announcing");
+        check(alert.update(true,true,true,2401,2500,100), "reclimb announces after 50 metre hysteresis");
+        check(!alert.update(true,true,false,2450,2500,100), "invalid altitude cannot announce");
+    }
+    {
+        const auto before=TunablesStore::read();
+        auto changed=before; changed.fusion.qnhHpa=990;
+        failStorage=true;
+        check(!TunablesStore::write(changed), "storage failure is returned");
+        check(TunablesStore::read().fusion.qnhHpa==before.fusion.qnhHpa, "failed persistence must not silently change live settings");
+        failStorage=false;
+        check(TunablesStore::write(changed), "atomic settings write succeeds");
+        TunablesStore::init();
+        check(TunablesStore::read().fusion.qnhHpa==990, "settings survive reload");
+        auto invalid=TunablesStore::read(); invalid.audio.strongSinkMps=-1;
+        check(!TunablesStore::write(invalid), "strong sink must be below normal sink threshold");
+        fakeNvs["settings"][8] ^= 0x40;
+        TunablesStore::init();
+        check(TunablesStore::read().fusion.qnhHpa==1013.25f, "corrupt settings rejected");
+    }
+    runXcTrackChecks();
+    {
+        auto saved=TunablesStore::read();
+        saved.fusion.qnhHpa=995;
+        saved.audio.toneMinHz=600; saved.audio.toneMaxHz=1800; saved.audio.sinkToneHz=300;
+        check(TunablesStore::write(saved),"save reference and legacy default tones together");
+        TunablesStore::init();
+        auto migrated=TunablesStore::read();
+        check(migrated.audio.toneMinHz==700 && migrated.audio.toneMaxHz==2200 &&
+              migrated.audio.sinkToneHz==450 && migrated.fusion.qnhHpa==995,
+              "speaker defaults migrate without changing altitude reference");
+        saved.audio.toneMinHz=650;
+        check(TunablesStore::write(saved),"save custom settings");
+        TunablesStore::init();
+        check(TunablesStore::read().audio.toneMinHz==650 && TunablesStore::read().audio.sinkToneHz==300,
+              "custom tones survive speaker migration");
+    }
+    runStabilityChecks();
+    printf("PASS: %u production C++ checks\n",checks);
+}

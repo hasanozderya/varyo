@@ -1,5 +1,4 @@
 #include "config.h"
-#if !VARIO_USE_WIFI
 #include "ble_task.h"
 #include "ble_protocol.h"
 #include "xctrack_protocol.h"
@@ -350,4 +349,3 @@ void bleTaskFunc(void*) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
-#endif
